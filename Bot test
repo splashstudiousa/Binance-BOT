@@ -1,0 +1,592 @@
+"""
+Binance Futures Signal Bot
+==========================
+A signal-only bot (NO real trading) that fetches live market data from
+Binance public API and displays EMA/RSI-based signals on a Flask dashboard.
+
+Requirements:
+    pip install flask requests pandas ta flask-cors
+
+Run:
+    python app.py
+Then open: http://localhost:5000
+"""
+
+import time
+import threading
+import logging
+from datetime import datetime
+
+import requests
+import pandas as pd
+import ta  # Technical Analysis library
+from flask import Flask, jsonify, render_template_string
+from flask_cors import CORS
+
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+SYMBOLS = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
+TIMEFRAMES = ["5m", "15m", "1h"]
+KLINE_LIMIT = 100          # Number of candles to fetch per request
+UPDATE_INTERVAL = 5        # Seconds between signal refreshes
+BINANCE_BASE = "https://fapi.binance.com"  # Futures endpoint (public)
+
+# Risk parameters (percentage-based)
+STOP_LOSS_PCT = 0.015      # 1.5% stop loss
+TAKE_PROFIT_PCT = 0.03     # 3.0% take profit
+
+# ─────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%H:%M:%S"
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# GLOBAL SIGNAL STORE  (updated by background thread)
+# ─────────────────────────────────────────────
+signal_store = {}   # { "BTCUSDT": { "5m": {...}, "15m": {...}, ... }, ... }
+store_lock = threading.Lock()
+
+# ─────────────────────────────────────────────
+# BINANCE DATA FETCHER
+# ─────────────────────────────────────────────
+
+def fetch_klines(symbol: str, interval: str, limit: int = KLINE_LIMIT) -> pd.DataFrame:
+    """
+    Fetch OHLCV candlestick data from Binance Futures public API.
+    No API key required.
+    Returns a DataFrame with columns: open, high, low, close, volume.
+    """
+    url = f"{BINANCE_BASE}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        raw = resp.json()
+    except Exception as e:
+        log.error(f"Failed to fetch {symbol} {interval}: {e}")
+        return pd.DataFrame()
+
+    df = pd.DataFrame(raw, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "qav", "trades", "tbb", "tbq", "ignore"
+    ])
+    # Keep only what we need and convert to float
+    df = df[["open_time", "open", "high", "low", "close", "volume"]].copy()
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+    return df
+
+
+# ─────────────────────────────────────────────
+# TECHNICAL INDICATORS
+# ─────────────────────────────────────────────
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add EMA-9, EMA-21, and RSI-14 columns to the DataFrame.
+    Uses the `ta` library for reliable calculations.
+    """
+    if df.empty or len(df) < 22:
+        return df
+
+    close = df["close"]
+
+    # Exponential Moving Averages
+    df["ema9"]  = ta.trend.EMAIndicator(close, window=9).ema_indicator()
+    df["ema21"] = ta.trend.EMAIndicator(close, window=21).ema_indicator()
+
+    # Relative Strength Index
+    df["rsi"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+
+    return df
+
+
+# ─────────────────────────────────────────────
+# SIGNAL ENGINE
+# ─────────────────────────────────────────────
+
+def generate_signal(df: pd.DataFrame, symbol: str, timeframe: str) -> dict:
+    """
+    Core signal logic:
+      LONG  → EMA9 > EMA21  AND  RSI < 65  AND  RSI > 40
+      SHORT → EMA9 < EMA21  AND  RSI > 35  AND  RSI < 60
+      HOLD  → anything else (conflicting signals)
+
+    Confidence is calculated from:
+      - EMA spread (how far apart the two EMAs are, as % of price)
+      - RSI distance from neutral zone (50)
+    """
+    if df.empty or len(df) < 22:
+        return _empty_signal(symbol, timeframe, "Insufficient data")
+
+    df = compute_indicators(df)
+    if df["ema9"].isna().all():
+        return _empty_signal(symbol, timeframe, "Indicator error")
+
+    # Use the latest completed candle (second-to-last row avoids partial candle)
+    latest = df.iloc[-2]
+    price   = round(latest["close"], 4)
+    ema9    = latest["ema9"]
+    ema21   = latest["ema21"]
+    rsi     = round(latest["rsi"], 2)
+
+    if pd.isna(ema9) or pd.isna(ema21) or pd.isna(rsi):
+        return _empty_signal(symbol, timeframe, "Indicator NaN")
+
+    # ── Signal Decision ──────────────────────
+    ema_bull = ema9 > ema21   # Bullish crossover
+    ema_bear = ema9 < ema21   # Bearish crossover
+    ema_spread_pct = abs(ema9 - ema21) / price * 100  # Strength of EMA divergence
+
+    if ema_bull and 40 <= rsi <= 65:
+        signal = "LONG"
+    elif ema_bear and 35 <= rsi <= 60:
+        signal = "SHORT"
+    else:
+        signal = "HOLD"
+
+    # ── Confidence Score (0–100) ─────────────
+    # Based on EMA spread (capped at 2%) + RSI divergence from 50
+    ema_score = min(ema_spread_pct / 2.0, 1.0) * 50   # up to 50 pts
+    rsi_score = min(abs(rsi - 50) / 30.0, 1.0) * 50   # up to 50 pts
+    confidence = round(ema_score + rsi_score, 1)
+
+    # For HOLD, reduce confidence
+    if signal == "HOLD":
+        confidence = round(confidence * 0.4, 1)
+
+    # ── Risk Parameters ──────────────────────
+    if signal == "LONG":
+        stop_loss   = round(price * (1 - STOP_LOSS_PCT), 4)
+        take_profit = round(price * (1 + TAKE_PROFIT_PCT), 4)
+    elif signal == "SHORT":
+        stop_loss   = round(price * (1 + STOP_LOSS_PCT), 4)
+        take_profit = round(price * (1 - TAKE_PROFIT_PCT), 4)
+    else:
+        stop_loss   = None
+        take_profit = None
+
+    return {
+        "symbol":      symbol,
+        "timeframe":   timeframe,
+        "signal":      signal,
+        "price":       price,
+        "ema9":        round(ema9, 4),
+        "ema21":       round(ema21, 4),
+        "rsi":         rsi,
+        "stop_loss":   stop_loss,
+        "take_profit": take_profit,
+        "confidence":  confidence,
+        "updated_at":  datetime.utcnow().strftime("%H:%M:%S UTC"),
+        "error":       None,
+    }
+
+
+def _empty_signal(symbol, timeframe, reason):
+    return {
+        "symbol": symbol, "timeframe": timeframe,
+        "signal": "N/A", "price": None,
+        "ema9": None, "ema21": None, "rsi": None,
+        "stop_loss": None, "take_profit": None,
+        "confidence": 0, "updated_at": "—", "error": reason,
+    }
+
+
+# ─────────────────────────────────────────────
+# BACKGROUND UPDATE THREAD
+# ─────────────────────────────────────────────
+
+def update_signals():
+    """
+    Runs in a background thread. Fetches klines and regenerates
+    signals for all symbol/timeframe combinations every UPDATE_INTERVAL seconds.
+    """
+    while True:
+        log.info("🔄 Updating signals...")
+        new_store = {}
+        for symbol in SYMBOLS:
+            new_store[symbol] = {}
+            for tf in TIMEFRAMES:
+                df = fetch_klines(symbol, tf)
+                sig = generate_signal(df, symbol, tf)
+                new_store[symbol][tf] = sig
+                log.info(
+                    f"  {symbol:10s} [{tf:3s}] → {sig['signal']:5s} "
+                    f"| Price: {sig['price']} | RSI: {sig['rsi']} "
+                    f"| Conf: {sig['confidence']}%"
+                )
+        with store_lock:
+            signal_store.update(new_store)
+        time.sleep(UPDATE_INTERVAL)
+
+
+# ─────────────────────────────────────────────
+# FLASK APP
+# ─────────────────────────────────────────────
+app = Flask(__name__)
+CORS(app)
+
+# ── API Endpoint ─────────────────────────────
+@app.route("/api/signals")
+def api_signals():
+    """Returns all current signals as JSON (polled by the frontend)."""
+    with store_lock:
+        return jsonify(signal_store)
+
+
+# ── Dashboard HTML (embedded) ─────────────────
+DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Crypto Signal Bot</title>
+  <style>
+    /* ── Reset & Base ──────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d1117;
+      color: #e6edf3;
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      min-height: 100vh;
+      padding: 24px 16px;
+    }
+
+    /* ── Header ───────────────────────────── */
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 28px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-icon {
+      width: 38px; height: 38px;
+      background: linear-gradient(135deg, #f0b90b, #e57b0f);
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 20px;
+    }
+    h1 { font-size: 1.4rem; font-weight: 700; color: #f0b90b; }
+    h1 span { color: #8b949e; font-weight: 400; font-size: 0.85rem; margin-left: 8px; }
+
+    .status-bar {
+      display: flex; align-items: center; gap: 8px;
+      background: #161b22; padding: 8px 14px; border-radius: 8px;
+      font-size: 0.8rem; color: #8b949e;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: #3fb950; animation: pulse 2s infinite;
+    }
+    @keyframes pulse {
+      0%,100% { opacity:1; } 50% { opacity:.3; }
+    }
+
+    /* ── Timeframe tabs ───────────────────── */
+    .tf-tabs {
+      display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap;
+    }
+    .tf-btn {
+      background: #161b22; border: 1px solid #30363d;
+      color: #8b949e; padding: 6px 18px; border-radius: 6px;
+      cursor: pointer; font-size: 0.85rem; transition: all .2s;
+    }
+    .tf-btn.active, .tf-btn:hover {
+      background: #f0b90b; color: #0d1117;
+      border-color: #f0b90b; font-weight: 600;
+    }
+
+    /* ── Signal Cards Grid ────────────────── */
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    .card {
+      background: #161b22;
+      border: 1px solid #21262d;
+      border-radius: 12px;
+      padding: 18px;
+      transition: transform .15s, border-color .2s;
+      position: relative;
+      overflow: hidden;
+    }
+    .card:hover { transform: translateY(-2px); border-color: #444c56; }
+    .card.LONG  { border-left: 4px solid #3fb950; }
+    .card.SHORT { border-left: 4px solid #f85149; }
+    .card.HOLD  { border-left: 4px solid #f0b90b; }
+
+    /* card header */
+    .card-header {
+      display: flex; justify-content: space-between; align-items: flex-start;
+      margin-bottom: 14px;
+    }
+    .symbol { font-size: 1.1rem; font-weight: 700; color: #e6edf3; }
+    .price  { font-size: 0.8rem; color: #8b949e; margin-top: 2px; }
+
+    .badge {
+      font-size: 0.78rem; font-weight: 700;
+      padding: 4px 12px; border-radius: 20px;
+      letter-spacing: .5px;
+    }
+    .badge.LONG  { background: #1a3c2a; color: #3fb950; }
+    .badge.SHORT { background: #3c1a1a; color: #f85149; }
+    .badge.HOLD  { background: #3c3010; color: #f0b90b; }
+    .badge.NA    { background: #21262d; color: #8b949e; }
+
+    /* indicators row */
+    .indicators {
+      display: flex; gap: 10px; margin-bottom: 14px;
+      flex-wrap: wrap;
+    }
+    .ind-box {
+      background: #0d1117; border-radius: 6px;
+      padding: 6px 10px; flex: 1; min-width: 70px;
+      text-align: center;
+    }
+    .ind-label { font-size: 0.65rem; color: #8b949e; text-transform: uppercase; }
+    .ind-value { font-size: 0.85rem; font-weight: 600; color: #e6edf3; margin-top: 2px; }
+    .ind-value.bull { color: #3fb950; }
+    .ind-value.bear { color: #f85149; }
+
+    /* confidence bar */
+    .conf-wrap { margin-bottom: 14px; }
+    .conf-label {
+      display: flex; justify-content: space-between;
+      font-size: 0.72rem; color: #8b949e; margin-bottom: 5px;
+    }
+    .conf-bar {
+      height: 5px; background: #21262d; border-radius: 3px; overflow: hidden;
+    }
+    .conf-fill {
+      height: 100%; border-radius: 3px;
+      background: linear-gradient(90deg, #f0b90b, #3fb950);
+      transition: width .4s ease;
+    }
+
+    /* risk table */
+    .risk-table { width: 100%; border-collapse: collapse; }
+    .risk-table td {
+      font-size: 0.75rem; padding: 3px 0;
+    }
+    .risk-table td:first-child { color: #8b949e; }
+    .risk-table td:last-child  { text-align: right; font-weight: 600; }
+    .sl  { color: #f85149; }
+    .tp  { color: #3fb950; }
+
+    .updated {
+      font-size: 0.65rem; color: #484f58; margin-top: 12px; text-align: right;
+    }
+
+    /* ── Loader ───────────────────────────── */
+    .loader {
+      text-align: center; padding: 60px; color: #8b949e; font-size: 1rem;
+    }
+    .spinner {
+      width: 36px; height: 36px; margin: 0 auto 16px;
+      border: 3px solid #21262d; border-top-color: #f0b90b;
+      border-radius: 50%; animation: spin .8s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Error card ───────────────────────── */
+    .error-msg { color: #f85149; font-size: 0.75rem; margin-top: 8px; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">
+    <div class="logo-icon">₿</div>
+    <div>
+      <h1>Crypto Signal Bot <span>SIGNAL ONLY — No real trades</span></h1>
+    </div>
+  </div>
+  <div class="status-bar">
+    <div class="dot"></div>
+    <span id="status-text">Connecting…</span>
+  </div>
+</header>
+
+<!-- Timeframe tabs -->
+<div class="tf-tabs" id="tf-tabs">
+  <button class="tf-btn active" onclick="setTf('5m')">5m</button>
+  <button class="tf-btn" onclick="setTf('15m')">15m</button>
+  <button class="tf-btn" onclick="setTf('1h')">1h</button>
+  <button class="tf-btn active-all" onclick="setTf('all')">All Timeframes</button>
+</div>
+
+<!-- Cards grid -->
+<div id="main-content">
+  <div class="loader">
+    <div class="spinner"></div>
+    Fetching live signals…
+  </div>
+</div>
+
+<script>
+  let currentTf = '5m';
+  let allData = {};
+
+  function setTf(tf) {
+    currentTf = tf;
+    document.querySelectorAll('.tf-btn').forEach(b => b.classList.remove('active'));
+    event.target.classList.add('active');
+    render();
+  }
+
+  async function fetchSignals() {
+    try {
+      const res = await fetch('/api/signals');
+      allData = await res.json();
+      document.getElementById('status-text').textContent =
+        'Live · Updated ' + new Date().toLocaleTimeString();
+      render();
+    } catch(e) {
+      document.getElementById('status-text').textContent = '⚠ Connection error';
+    }
+  }
+
+  function fmtNum(n, decimals=4) {
+    if (n === null || n === undefined) return '—';
+    return parseFloat(n).toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: decimals
+    });
+  }
+
+  function cardHTML(sig) {
+    const signal = sig.signal || 'N/A';
+    const badgeClass = ['LONG','SHORT','HOLD'].includes(signal) ? signal : 'NA';
+    const emaBull = sig.ema9 > sig.ema21;
+    const rsiClass = sig.rsi > 60 ? 'bear' : sig.rsi < 40 ? 'bull' : '';
+
+    const riskRows = (signal !== 'HOLD' && signal !== 'N/A' && sig.stop_loss)
+      ? `<tr>
+           <td>Stop Loss</td>
+           <td class="sl">${fmtNum(sig.stop_loss)}</td>
+         </tr>
+         <tr>
+           <td>Take Profit</td>
+           <td class="tp">${fmtNum(sig.take_profit)}</td>
+         </tr>`
+      : `<tr><td colspan="2" style="color:#484f58;text-align:center;padding-top:6px">
+           No risk targets for HOLD</td></tr>`;
+
+    const errMsg = sig.error ? `<div class="error-msg">⚠ ${sig.error}</div>` : '';
+
+    return `
+      <div class="card ${signal}">
+        <div class="card-header">
+          <div>
+            <div class="symbol">${sig.symbol}</div>
+            <div class="price">$${fmtNum(sig.price)} · ${sig.timeframe}</div>
+          </div>
+          <div class="badge ${badgeClass}">${signal}</div>
+        </div>
+
+        <div class="indicators">
+          <div class="ind-box">
+            <div class="ind-label">EMA 9</div>
+            <div class="ind-value ${emaBull?'bull':'bear'}">${fmtNum(sig.ema9)}</div>
+          </div>
+          <div class="ind-box">
+            <div class="ind-label">EMA 21</div>
+            <div class="ind-value ${emaBull?'bear':'bull'}">${fmtNum(sig.ema21)}</div>
+          </div>
+          <div class="ind-box">
+            <div class="ind-label">RSI 14</div>
+            <div class="ind-value ${rsiClass}">${sig.rsi ?? '—'}</div>
+          </div>
+        </div>
+
+        <div class="conf-wrap">
+          <div class="conf-label">
+            <span>Confidence</span>
+            <span>${sig.confidence}%</span>
+          </div>
+          <div class="conf-bar">
+            <div class="conf-fill" style="width:${sig.confidence}%"></div>
+          </div>
+        </div>
+
+        <table class="risk-table">
+          <tr>
+            <td>Entry Price</td>
+            <td>$${fmtNum(sig.price)}</td>
+          </tr>
+          ${riskRows}
+        </table>
+        ${errMsg}
+        <div class="updated">⟳ ${sig.updated_at}</div>
+      </div>`;
+  }
+
+  function render() {
+    if (!Object.keys(allData).length) return;
+
+    const tfs = currentTf === 'all' ? ['5m','15m','1h'] : [currentTf];
+    let html = '<div class="grid">';
+
+    for (const sym of Object.keys(allData)) {
+      for (const tf of tfs) {
+        const sig = allData[sym]?.[tf];
+        if (sig) html += cardHTML(sig);
+      }
+    }
+    html += '</div>';
+    document.getElementById('main-content').innerHTML = html;
+  }
+
+  // Initial fetch + polling every 5 seconds
+  fetchSignals();
+  setInterval(fetchSignals, 5000);
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def dashboard():
+    return render_template_string(DASHBOARD_HTML)
+
+
+# ─────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────
+if __name__ == "__main__":
+    log.info("=" * 55)
+    log.info("  🚀  Binance Futures Signal Bot  (SIGNAL ONLY)")
+    log.info("=" * 55)
+    log.info(f"  Symbols    : {', '.join(SYMBOLS)}")
+    log.info(f"  Timeframes : {', '.join(TIMEFRAMES)}")
+    log.info(f"  Refresh    : every {UPDATE_INTERVAL}s")
+    log.info("  Dashboard  : http://localhost:5000")
+    log.info("=" * 55)
+
+    # Run first update synchronously so dashboard loads with data
+    log.info("⏳ Running initial signal fetch…")
+    for symbol in SYMBOLS:
+        signal_store[symbol] = {}
+        for tf in TIMEFRAMES:
+            df = fetch_klines(symbol, tf)
+            signal_store[symbol][tf] = generate_signal(df, symbol, tf)
+    log.info("✅ Initial signals ready.")
+
+    # Start background updater thread
+    t = threading.Thread(target=update_signals, daemon=True)
+    t.start()
+
+    # Launch Flask (use_reloader=False avoids double threads on Windows)
+    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
